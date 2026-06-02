@@ -1,0 +1,70 @@
+name: Deploy OpenAI Ads → BigQuery job
+
+# Build the container and (re)deploy the Cloud Run Job on every push to main.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {}   # allow manual runs from the Actions tab
+
+# These come from GitHub repo settings (Settings → Secrets and variables).
+# Variables (Settings → Variables):
+#   GCP_PROJECT_ID, GCP_REGION, AR_REPO, JOB_NAME, RUN_SA_EMAIL,
+#   BQ_DATASET, BQ_LOCATION, WIF_PROVIDER, DEPLOY_SA_EMAIL
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  REPO: ${{ vars.AR_REPO }}
+  JOB: ${{ vars.JOB_NAME }}
+  RUN_SA: ${{ vars.RUN_SA_EMAIL }}
+  BQ_DATASET: ${{ vars.BQ_DATASET }}
+  BQ_LOCATION: ${{ vars.BQ_LOCATION }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # required for Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          # Workload Identity Federation — no long-lived JSON key needed.
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${JOB}:${GITHUB_SHA::7}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          gcloud builds submit --tag "$IMAGE" --project "$PROJECT_ID"
+
+      - name: Deploy / update Cloud Run Job
+        run: |
+          # Create the job on first deploy, otherwise update it.
+          if gcloud run jobs describe "$JOB" --region "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
+            ACTION=update
+          else
+            ACTION=create
+          fi
+
+          gcloud run jobs "$ACTION" "$JOB" \
+            --image "$IMAGE" \
+            --region "$REGION" \
+            --service-account "$RUN_SA" \
+            --max-retries 1 \
+            --task-timeout 1800 \
+            --set-env-vars "GCP_PROJECT=${PROJECT_ID},BQ_DATASET=${BQ_DATASET},BQ_LOCATION=${BQ_LOCATION},LOOKBACK_DAYS=7" \
+            --set-secrets "OPENAI_ADS_API_KEY=openai-ads-api-key:latest" \
+            --project "$PROJECT_ID"
