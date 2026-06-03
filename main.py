@@ -351,5 +351,33 @@ def run():
     return total
 
 
+# --------------------------------------------------------------------------- #
+# Web service wrapper (Cloud Run Service)
+# --------------------------------------------------------------------------- #
+# Cloud Run Services must listen for HTTP requests. Cloud Scheduler calls this
+# endpoint daily to trigger the pipeline. The ETL logic above is unchanged.
+
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+
+@app.route("/", methods=["GET", "POST"])
+def trigger():
+    """Run the pipeline when invoked, and report how many rows were loaded."""
+    try:
+        total = run()
+        return jsonify({"status": "ok", "rows_loaded": total}), 200
+    except Exception as exc:  # surface failures to the caller / logs
+        log.exception("Pipeline failed")
+        return jsonify({"status": "error", "detail": str(exc)}), 500
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
+
+
 if __name__ == "__main__":
-    run()
+    # Cloud Run provides the port via the PORT env var (defaults to 8080).
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
