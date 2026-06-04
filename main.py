@@ -53,6 +53,9 @@ GCP_PROJECT = os.environ.get("GCP_PROJECT")
 BQ_DATASET = os.environ.get("BQ_DATASET")
 BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
+# Floor date: the pipeline never pulls data earlier than this (the campaign's
+# first active day). Format YYYY-MM-DD.
+START_DATE = os.environ.get("START_DATE", "2026-05-01")
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.ads.openai.com/v1").rstrip("/")
 
 PAGE_LIMIT = 1000          # rows per page (API max is 10000)
@@ -329,14 +332,34 @@ def load_rows(client, table_id, rows, schema):
 # Orchestration
 # --------------------------------------------------------------------------- #
 
-def run():
+def _parse_start_date():
+    try:
+        return datetime.strptime(START_DATE, "%Y-%m-%d").date()
+    except ValueError:
+        log.error("Invalid START_DATE %r; expected YYYY-MM-DD", START_DATE)
+        sys.exit(2)
+
+
+def run(backfill=False):
     _require("OPENAI_ADS_API_KEY", API_KEY)
     _require("GCP_PROJECT", GCP_PROJECT)
     _require("BQ_DATASET", BQ_DATASET)
 
+    floor = _parse_start_date()
     until = date.today() - timedelta(days=1)           # through yesterday
-    since = until - timedelta(days=LOOKBACK_DAYS - 1)   # inclusive window
-    log.info("Pulling OpenAI Ads reports from %s to %s", since, until)
+
+    if backfill:
+        # One-time historical load: entire range from the floor date.
+        since = floor
+        log.info("BACKFILL run: %s to %s", since, until)
+    else:
+        # Normal daily: rolling lookback window, but never before the floor.
+        since = max(floor, until - timedelta(days=LOOKBACK_DAYS - 1))
+        log.info("Daily run (lookback=%s): %s to %s", LOOKBACK_DAYS, since, until)
+
+    if since > until:
+        log.info("Nothing to pull (since %s is after until %s).", since, until)
+        return 0
 
     session = _session()
     client = bigquery.Client(project=GCP_PROJECT, location=BQ_LOCATION)
@@ -365,16 +388,19 @@ def run():
 # Web service wrapper (Cloud Run Service)
 # --------------------------------------------------------------------------- #
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
 
 @app.route("/", methods=["GET", "POST"])
 def trigger():
+    # Trigger a one-time historical backfill with ?backfill=true; otherwise
+    # a normal daily rolling-lookback run.
+    backfill = request.args.get("backfill", "").lower() in ("1", "true", "yes")
     try:
-        total = run()
-        return jsonify({"status": "ok", "rows_loaded": total}), 200
+        total = run(backfill=backfill)
+        return jsonify({"status": "ok", "rows_loaded": total, "backfill": backfill}), 200
     except Exception as exc:
         log.exception("Pipeline failed")
         return jsonify({"status": "error", "detail": str(exc)}), 500
