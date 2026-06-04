@@ -1,12 +1,22 @@
 """
-OpenAI Ads Manager -> BigQuery daily insights pipeline.
+OpenAI Ads Manager -> BigQuery daily reports pipeline.
 
-Pulls daily-granularity insights at four aggregation levels
-(ad_account, campaign, ad_group, ad) from the OpenAI Advertiser API
-and loads them into BigQuery, idempotently, over a configurable
-lookback window.
+Pulls daily-granularity insights from the OpenAI Advertiser API and loads
+them into BigQuery as three reports, idempotently, over a configurable
+lookback window. Runs as a Cloud Run Service triggered daily by Cloud
+Scheduler (HTTP).
 
-Designed to run as a Cloud Run Job triggered daily by Cloud Scheduler.
+Reports
+-------
+Report 1  openai_ads_landing_page_report   (ad level)
+    Day, Campaign tracking ID, Ad group tracking ID, Landing Page URL, Cost
+Report 2  openai_ads_campaign_report        (campaign level)
+    Day, Campaign tracking ID, Campaign name, Cost
+Report 3  openai_ads_geo_report             (ad group level)
+    Day, Campaign tracking ID, Ad group tracking ID, Country, Cost
+    (Country requested from the API; currently returns empty for this
+     account, so the column may be null until OpenAI populates it. Country
+     is derived downstream in a BigQuery view via the AFID dim table.)
 
 Environment variables
 ----------------------
@@ -15,7 +25,6 @@ GCP_PROJECT          (required)  BigQuery project id.
 BQ_DATASET           (required)  BigQuery dataset (must already exist).
 BQ_LOCATION          (optional)  Dataset location, default "US".
 LOOKBACK_DAYS        (optional)  How many days back to refresh, default 7.
-TABLE_PREFIX         (optional)  Table name prefix, default "openai_ads".
 API_BASE_URL         (optional)  Default "https://api.ads.openai.com/v1".
 """
 
@@ -44,37 +53,73 @@ GCP_PROJECT = os.environ.get("GCP_PROJECT")
 BQ_DATASET = os.environ.get("BQ_DATASET")
 BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
-TABLE_PREFIX = os.environ.get("TABLE_PREFIX", "openai_ads")
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.ads.openai.com/v1").rstrip("/")
 
 PAGE_LIMIT = 1000          # rows per page (API max is 10000)
 MAX_RETRIES = 6            # retry attempts for 429 / 5xx
 REQUEST_TIMEOUT = 60       # seconds
 
-# Metric fields shared by every aggregation level.
-METRIC_FIELDS = ["impressions", "clicks", "spend", "ctr", "cpc", "cpm"]
-
-# Per-level field projection. "readable_time" is the daily bucket label.
-# Each level adds the id/name metadata appropriate to its scope.
-LEVEL_CONFIG = {
-    "ad_account": {
-        "table": f"{TABLE_PREFIX}_account_insights",
-        "id_fields": [],
+# Each report is one API pull at a given aggregation level, projecting a
+# specific set of fields, written to one BigQuery table.
+#
+# "api_fields"   -> exactly what we request from the API (validated names).
+# "columns"      -> ordered (BigQuery column label, BigQuery type, source key
+#                   in the API response row) tuples. The column labels match
+#                   the report spec exactly ("Day", "Cost", etc.).
+#
+# The API normalizes dotted request names (ad.spend) to flat response keys
+# (spend), so the source keys below are the flat keys seen in real responses.
+REPORTS = {
+    "landing_page": {
+        "table": "openai_ads_landing_page_report",
+        "aggregation_level": "ad",
+        "api_fields": [
+            "metadata.readable_time",
+            "campaign.id",
+            "ad_group.id",
+            "ad.link",
+            "ad.spend",
+        ],
+        "columns": [
+            ("Day", "DATE", "_report_date"),
+            ("Campaign tracking ID", "STRING", "campaign_id"),
+            ("Ad group tracking ID", "STRING", "ad_group_id"),
+            ("Landing Page URL", "STRING", "ad_link"),
+            ("Cost", "NUMERIC", "spend"),
+        ],
     },
     "campaign": {
-        "table": f"{TABLE_PREFIX}_campaign_insights",
-        "id_fields": ["campaign_id", "campaign_name"],
+        "table": "openai_ads_campaign_report",
+        "aggregation_level": "campaign",
+        "api_fields": [
+            "metadata.readable_time",
+            "campaign.id",
+            "campaign.name",
+            "campaign.spend",
+        ],
+        "columns": [
+            ("Day", "DATE", "_report_date"),
+            ("Campaign tracking ID", "STRING", "campaign_id"),
+            ("Campaign name", "STRING", "campaign_name"),
+            ("Cost", "NUMERIC", "spend"),
+        ],
     },
-    "ad_group": {
-        "table": f"{TABLE_PREFIX}_adgroup_insights",
-        "id_fields": ["campaign_id", "campaign_name", "ad_group_id", "ad_group_name"],
-    },
-    "ad": {
-        "table": f"{TABLE_PREFIX}_ad_insights",
-        "id_fields": [
-            "campaign_id", "campaign_name",
-            "ad_group_id", "ad_group_name",
-            "ad_id", "ad_name",
+    "geo": {
+        "table": "openai_ads_geo_report",
+        "aggregation_level": "ad_group",
+        "api_fields": [
+            "metadata.readable_time",
+            "campaign.id",
+            "ad_group.id",
+            "country",
+            "ad_group.spend",
+        ],
+        "columns": [
+            ("Day", "DATE", "_report_date"),
+            ("Campaign tracking ID", "STRING", "campaign_id"),
+            ("Ad group tracking ID", "STRING", "ad_group_id"),
+            ("Country", "STRING", "country"),
+            ("Cost", "NUMERIC", "spend"),
         ],
     },
 }
@@ -111,7 +156,6 @@ def _get_with_retries(session, url, params):
             return resp.json()
 
         if resp.status_code == 429 or resp.status_code >= 500:
-            # Respect a reset header if present, else exponential backoff.
             reset = resp.headers.get("x-ratelimit-reset-requests")
             try:
                 wait = float(reset) if reset else backoff
@@ -126,7 +170,6 @@ def _get_with_retries(session, url, params):
             backoff = min(backoff * 2, 120.0)
             continue
 
-        # Non-retryable error.
         raise RuntimeError(
             f"OpenAI Ads API error {resp.status_code}: {resp.text[:500]}"
         )
@@ -134,13 +177,8 @@ def _get_with_retries(session, url, params):
     raise RuntimeError(f"Exhausted retries calling {url}")
 
 
-def fetch_insights(session, aggregation_level, fields, since, until):
-    """
-    Pull all daily insight rows for one aggregation level over [since, until].
-
-    Uses the account-level endpoint with an aggregation_level breakdown so a
-    single endpoint covers every scope. Handles cursor pagination.
-    """
+def fetch_report_rows(session, aggregation_level, api_fields, since, until):
+    """Pull all daily rows for one report over [since, until] with pagination."""
     url = f"{API_BASE_URL}/ad_account/insights"
     time_range = json.dumps(
         {"type": "date_range", "since": since.isoformat(), "until": until.isoformat()}
@@ -158,7 +196,7 @@ def fetch_insights(session, aggregation_level, fields, since, until):
             ("limit", str(PAGE_LIMIT)),
             ("time_ranges[]", time_range),
         ]
-        for f in fields:
+        for f in api_fields:
             params.append(("fields[]", f))
         if after:
             params.append(("after", after))
@@ -183,7 +221,7 @@ def fetch_insights(session, aggregation_level, fields, since, until):
 # Transform
 # --------------------------------------------------------------------------- #
 
-def _to_float(value):
+def _to_numeric(value):
     if value is None or value == "":
         return None
     try:
@@ -192,25 +230,17 @@ def _to_float(value):
         return None
 
 
-def _to_int(value):
-    f = _to_float(value)
-    return int(f) if f is not None else None
-
-
 def _report_date(row):
-    """Derive the DATE for the daily bucket from readable_time or start_time."""
+    """Derive a DATE string from readable_time or start_time."""
     rt = row.get("readable_time")
     if rt:
-        # readable_time is typically an ISO date or datetime string.
-        for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
-            try:
-                return datetime.strptime(rt[: len(fmt) + 2], fmt).date().isoformat()
-            except ValueError:
-                continue
         try:
             return datetime.fromisoformat(rt.replace("Z", "+00:00")).date().isoformat()
         except ValueError:
-            pass
+            try:
+                return datetime.strptime(rt[:10], "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                pass
     st = row.get("start_time")
     if st is not None:
         try:
@@ -220,27 +250,22 @@ def _report_date(row):
     return None
 
 
-def transform_rows(raw_rows, level_cfg):
-    """Map raw API rows into BigQuery-ready dicts matching the table schema."""
+def transform_rows(raw_rows, report_cfg):
+    """Map raw API rows into BigQuery-ready dicts keyed by report column label."""
     loaded_at = datetime.now(tz=timezone.utc).isoformat()
     out = []
     for row in raw_rows:
-        record = {
-            "report_date": _report_date(row),
-            "row_id": row.get("id"),
-            "start_time": _to_int(row.get("start_time")),
-            "end_time": _to_int(row.get("end_time")),
-            "timezone": row.get("timezone"),
-            "impressions": _to_int(row.get("impressions")),
-            "clicks": _to_int(row.get("clicks")),
-            "spend": _to_float(row.get("spend")),
-            "ctr": _to_float(row.get("ctr")),
-            "cpc": _to_float(row.get("cpc")),
-            "cpm": _to_float(row.get("cpm")),
-            "_loaded_at": loaded_at,
-        }
-        for f in level_cfg["id_fields"]:
-            record[f] = row.get(f)
+        # Make the derived report date available under a synthetic source key.
+        row = dict(row)
+        row["_report_date"] = _report_date(row)
+
+        record = {}
+        for label, col_type, source_key in report_cfg["columns"]:
+            value = row.get(source_key)
+            if col_type == "NUMERIC":
+                value = _to_numeric(value)
+            record[label] = value
+        record["_loaded_at"] = loaded_at
         out.append(record)
     return out
 
@@ -249,45 +274,30 @@ def transform_rows(raw_rows, level_cfg):
 # BigQuery
 # --------------------------------------------------------------------------- #
 
-def build_schema(level_cfg):
-    schema = [
-        bigquery.SchemaField("report_date", "DATE"),
-        bigquery.SchemaField("row_id", "STRING"),
-        bigquery.SchemaField("start_time", "INTEGER"),
-        bigquery.SchemaField("end_time", "INTEGER"),
-        bigquery.SchemaField("timezone", "STRING"),
-    ]
-    for f in level_cfg["id_fields"]:
-        schema.append(bigquery.SchemaField(f, "STRING"))
-    schema.extend(
-        [
-            bigquery.SchemaField("impressions", "INTEGER"),
-            bigquery.SchemaField("clicks", "INTEGER"),
-            bigquery.SchemaField("spend", "FLOAT"),
-            bigquery.SchemaField("ctr", "FLOAT"),
-            bigquery.SchemaField("cpc", "FLOAT"),
-            bigquery.SchemaField("cpm", "FLOAT"),
-            bigquery.SchemaField("_loaded_at", "TIMESTAMP"),
-        ]
-    )
+def build_schema(report_cfg):
+    schema = []
+    for label, col_type, _ in report_cfg["columns"]:
+        schema.append(bigquery.SchemaField(label, col_type))
+    schema.append(bigquery.SchemaField("_loaded_at", "TIMESTAMP"))
     return schema
 
 
 def ensure_table(client, table_id, schema):
     table = bigquery.Table(table_id, schema=schema)
+    # Partition by the report date column ("Day").
     table.time_partitioning = bigquery.TimePartitioning(
         type_=bigquery.TimePartitioningType.DAY,
-        field="report_date",
+        field="Day",
     )
     client.create_table(table, exists_ok=True)
     log.info("  ensured table %s", table_id)
 
 
 def replace_window(client, table_id, since, until):
-    """Delete existing rows in the lookback window so the load is idempotent."""
+    """Delete rows in the lookback window so each load is idempotent."""
     query = f"""
         DELETE FROM `{table_id}`
-        WHERE report_date BETWEEN @since AND @until
+        WHERE `Day` BETWEEN @since AND @until
     """
     job = client.query(
         query,
@@ -324,19 +334,19 @@ def run():
     _require("GCP_PROJECT", GCP_PROJECT)
     _require("BQ_DATASET", BQ_DATASET)
 
-    until = date.today() - timedelta(days=1)          # through yesterday (complete day)
-    since = until - timedelta(days=LOOKBACK_DAYS - 1)  # inclusive lookback window
-    log.info("Pulling OpenAI Ads insights from %s to %s", since, until)
+    until = date.today() - timedelta(days=1)           # through yesterday
+    since = until - timedelta(days=LOOKBACK_DAYS - 1)   # inclusive window
+    log.info("Pulling OpenAI Ads reports from %s to %s", since, until)
 
     session = _session()
     client = bigquery.Client(project=GCP_PROJECT, location=BQ_LOCATION)
 
     total = 0
-    for level, cfg in LEVEL_CONFIG.items():
-        log.info("Level: %s", level)
-        fields = ["readable_time", "timezone"] + cfg["id_fields"] + METRIC_FIELDS
-
-        raw = fetch_insights(session, level, fields, since, until)
+    for name, cfg in REPORTS.items():
+        log.info("Report: %s", name)
+        raw = fetch_report_rows(
+            session, cfg["aggregation_level"], cfg["api_fields"], since, until
+        )
         rows = transform_rows(raw, cfg)
 
         table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{cfg['table']}"
@@ -347,15 +357,13 @@ def run():
         load_rows(client, table_id, rows, schema)
         total += len(rows)
 
-    log.info("Done. Loaded %s rows across %s levels.", total, len(LEVEL_CONFIG))
+    log.info("Done. Loaded %s rows across %s reports.", total, len(REPORTS))
     return total
 
 
 # --------------------------------------------------------------------------- #
 # Web service wrapper (Cloud Run Service)
 # --------------------------------------------------------------------------- #
-# Cloud Run Services must listen for HTTP requests. Cloud Scheduler calls this
-# endpoint daily to trigger the pipeline. The ETL logic above is unchanged.
 
 from flask import Flask, jsonify
 
@@ -364,11 +372,10 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET", "POST"])
 def trigger():
-    """Run the pipeline when invoked, and report how many rows were loaded."""
     try:
         total = run()
         return jsonify({"status": "ok", "rows_loaded": total}), 200
-    except Exception as exc:  # surface failures to the caller / logs
+    except Exception as exc:
         log.exception("Pipeline failed")
         return jsonify({"status": "error", "detail": str(exc)}), 500
 
@@ -379,5 +386,4 @@ def healthz():
 
 
 if __name__ == "__main__":
-    # Cloud Run provides the port via the PORT env var (defaults to 8080).
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
