@@ -1,4 +1,4 @@
-# OpenAI Ads → BigQuery (daily, all levels)
+# OpenAI Ads → BigQuery (hourly refresh, all levels)
 
 A small ETL pipeline that pulls **daily-granularity insights** from the OpenAI
 Advertiser API at all four aggregation levels — **ad account, campaign, ad
@@ -120,9 +120,29 @@ bq query --use_legacy_sql=false \
    GROUP BY report_date ORDER BY report_date DESC LIMIT 10"
 ```
 
-## 5. Schedule it daily
+## 5. Schedule it hourly
 
-Cloud Scheduler invokes the job through the Cloud Run Admin API.
+The live deployment is a Cloud Run **Service** (`openai-ads`, region `us-east1`)
+that Cloud Scheduler triggers over plain HTTP against the service URL. Point the
+schedule at the service and set an hourly cron:
+
+```bash
+gcloud scheduler jobs update http <SCHEDULER_JOB_NAME> \
+  --location <SCHEDULER_LOCATION> \
+  --schedule "0 * * * *" \
+  --time-zone "America/New_York" \
+  --project variant-finance-data-project
+```
+
+Each day's first run sweeps the last 7 days; the other 23 pull only today. Every
+run replaces its window rather than appending to it, so hourly execution
+corrects today's partial numbers in place and never duplicates rows. See
+**Refresh model** below.
+
+### Legacy: Cloud Run Job scheduling
+
+The sections below describe the original Cloud Run **Job** setup, which the
+service replaced. Kept for reference.
 
 ```bash
 # Allow Scheduler's service account to invoke the job
@@ -142,8 +162,106 @@ gcloud scheduler jobs create http openai-ads-bq-daily \
   --project "$PROJECT_ID"
 ```
 
-This runs at 09:00 ET daily and pulls through *yesterday* (the last complete
-day). Adjust `--schedule` / `--time-zone` as needed.
+## Refresh model
+
+### How much each run pulls
+
+Each day opens with one wide sweep, then costs a single day per hour for the
+remaining 23 runs:
+
+| Situation | Window pulled |
+| --- | --- |
+| **The day's first run** (00:00) | last **7** days (`DAILY_LOOKBACK_DAYS`) |
+| **Every later run that day** (01:00–23:00) | **today only** (`LOOKBACK_DAYS`) |
+| The very first run ever | last **7** days — it has no marker either |
+| Back after an outage | 7 days, since it counts as a first-of-day run |
+| `?backfill=true` | account `start_date` → today |
+
+So a normal day looks like:
+
+```
+00:00   7 days   <- sweep: re-pulls the week, correcting anything restated
+01:00   today
+02:00   today
+ ...
+23:00   today
+00:00   7 days   <- next day's sweep, which settles yesterday for good
+```
+
+The sweep is what makes the numbers trustworthy. Ad platforms revise figures
+after the fact — clicks flagged as invalid, billing corrections — and the
+sweep re-pulls the last week every morning so those land automatically. The
+hourly runs in between only chase today, which is the only day still moving.
+
+### How it knows which run is the day's first
+
+A small bookkeeping table, `openai_ads_sync_state`, holds one row per account
+per report:
+
+| account_name | report | last_until | last_run_at |
+| --- | --- | --- | --- |
+| Variant Group LLC | campaign | 2026-08-04 | 2026-08-04 14:00:03 UTC |
+
+Compare `last_until` against today:
+
+- `last_until` **missing or older than today** → no run has covered today yet →
+  **7-day sweep**
+- `last_until` **is today** → already swept this morning → **today only**
+
+It has to be tracked explicitly, because the report data can't answer the
+question. Rows being present only proves *something* loaded them once, and an
+account with paused campaigns returns no rows at all no matter how often the
+pipeline runs — so a `MAX(Day)` over the report tables would freeze in place.
+The marker advances on every successful run either way.
+
+The marker is written **after** the rows are committed, so a run that crashes
+part-way leaves it untouched and the next run redoes that window rather than
+stepping over it.
+
+Because no window is ever sized from *how stale* the marker is, downtime can't
+inflate a run — coming back after a month still sweeps 7 days, not 30. Gaps
+older than a week need `?backfill=true`.
+
+To force a sweep on the next run, delete the relevant rows:
+
+```sql
+DELETE FROM `variant-finance-data-project.OpenAI_Ads.openai_ads_sync_state`
+WHERE account_name = 'Variant Group LLC'
+```
+
+### The two knobs
+
+`DAILY_LOOKBACK_DAYS` (default `7`) — how far the day's first run reaches back.
+Raise it if the API restates figures more than a week late.
+
+`LOOKBACK_DAYS` (default `1`) — how far every later run that day reaches back.
+`1` means today only. Raising it costs API traffic on all 23 runs, so prefer
+widening the daily sweep instead.
+
+Tracking is **per (account, report)**, so adding a fourth report later takes
+its own sweep without dragging the existing three back through days they
+already have.
+
+### Why re-running never duplicates
+
+Every run, for each account and each table, does two things in order:
+
+1. `DELETE` the rows in the window belonging to **that account** (scoped by
+   `Account name`, so one account never clears another's data).
+2. `INSERT` the freshly pulled rows for that window.
+
+The window is *replaced*, not appended to. Running once an hour rewrites today
+with progressively better numbers instead of stacking 24 copies of it. Days
+outside the window are never touched.
+
+Two consequences worth knowing:
+
+- **Today's row values are partial** and climb through the day. Anything
+  downstream that needs only settled days should filter `Day < CURRENT_DATE()`.
+- **The delete and the insert are separate statements.** For a few seconds each
+  hour today's rows are absent from BigQuery. A dashboard querying at that
+  instant sees a gap. If that matters, stage the load and swap it in inside a
+  `BEGIN TRANSACTION` / `COMMIT` block.
 
 ## Configuration reference
 
@@ -153,7 +271,8 @@ day). Adjust `--schedule` / `--time-zone` as needed.
 | `GCP_PROJECT` | yes | — | BigQuery project id |
 | `BQ_DATASET` | yes | — | Target dataset (must exist) |
 | `BQ_LOCATION` | no | `US` | Dataset location |
-| `LOOKBACK_DAYS` | no | `7` | Days re-pulled each run |
+| `DAILY_LOOKBACK_DAYS` | no | `7` | Window for the day's first run (the sweep) |
+| `LOOKBACK_DAYS` | no | `1` | Window for every later run that day |
 | `TABLE_PREFIX` | no | `openai_ads` | Table name prefix |
 | `API_BASE_URL` | no | `https://api.ads.openai.com/v1` | API base |
 

@@ -12,9 +12,10 @@ COPY main.py .
 ENV GCP_PROJECT=variant-finance-data-project \
     BQ_DATASET=OpenAI_Ads \
     BQ_LOCATION=US \
-    LOOKBACK_DAYS=7 \
+    DAILY_LOOKBACK_DAYS=7 \
+    LOOKBACK_DAYS=1 \
     PORT=8080
 
 # Cloud Run Services listen on $PORT. gunicorn serves the Flask app; the long
-# timeout lets the daily ETL finish within one request.
+# timeout lets the ETL finish within one request.
 CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 1800 main:app

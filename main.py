@@ -3,8 +3,39 @@ OpenAI Ads Manager -> BigQuery daily reports pipeline (multi-account).
 
 Pulls daily-granularity insights from the OpenAI Advertiser API for one or more
 ad accounts and loads them into BigQuery as three reports, idempotently, over a
-configurable lookback window. Runs as a Cloud Run Service triggered daily by
+configurable lookback window. Runs as a Cloud Run Service triggered hourly by
 Cloud Scheduler (HTTP).
+
+Refresh model
+-------------
+The pipeline records every successful run in a small bookkeeping table
+(openai_ads_sync_state), one row per account per report, holding the last day
+it loaded. Comparing that marker against today sizes the next window:
+
+  marker is missing, or older than today — the day's FIRST run
+      -> DAILY_LOOKBACK_DAYS (default 7), a deep sweep that re-pulls the
+         past week so late restatements get corrected
+  marker already says today — every later run that day
+      -> LOOKBACK_DAYS (default 1), today only
+
+So each day opens with one wide run and then costs a single day per hour for
+the remaining 23.
+
+The marker exists because nothing in the report data can answer "has a run
+covered today yet?". Rows being present only means something loaded them once,
+and an account with paused campaigns returns no rows at all however often we
+run — so a MAX(Day) over the report tables would freeze in place. The marker
+advances on every successful run regardless.
+
+An outage is self-correcting: come back after days down and the next run is a
+first-of-day run, so it sweeps a week unprompted. Since no window is ever
+derived from how stale the marker is, downtime cannot widen a run beyond
+DAILY_LOOKBACK_DAYS. Gaps older than that are a ?backfill=true job.
+
+Whatever the window is, the load DELETEs that range for that account before
+appending the fresh rows, so re-running never duplicates — it replaces. Today's
+figures are partial by definition and firm up over the day; days outside the
+window are never touched.
 
 Multi-account model
 -------------------
@@ -51,7 +82,8 @@ OPENAI_ADS_ACCOUNTS  (required)  JSON array of accounts (see above).
 GCP_PROJECT          (required)  BigQuery project id.
 BQ_DATASET           (required)  BigQuery dataset (must already exist).
 BQ_LOCATION          (optional)  Dataset location, default "US".
-LOOKBACK_DAYS        (optional)  How many days back to refresh, default 7.
+DAILY_LOOKBACK_DAYS  (optional)  Window for the day's first run, default 7.
+LOOKBACK_DAYS        (optional)  Window for the rest of the day, default 1.
 START_DATE           (optional)  Global floor date, default "2026-05-01".
 API_BASE_URL         (optional)  Default "https://api.ads.openai.com/v1".
 """
@@ -81,7 +113,20 @@ ACCOUNTS_JSON = os.environ.get("OPENAI_ADS_ACCOUNTS")
 GCP_PROJECT = os.environ.get("GCP_PROJECT")
 BQ_DATASET = os.environ.get("BQ_DATASET")
 BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
+# Width of the day's FIRST run — the deep sweep that re-pulls a week so late
+# restatements of recent days get corrected. Also used for the very first run
+# the pipeline ever performs.
+DAILY_LOOKBACK_DAYS = int(os.environ.get("DAILY_LOOKBACK_DAYS", "7"))
+# Width of every OTHER run in the day. 1 = today only, which is all the hourly
+# cadence needs: the deep sweep already settled everything older this morning.
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "1"))
+
+# Bookkeeping table: one row per (account, report) recording the last window
+# this pipeline successfully loaded. It is what distinguishes "first ever run"
+# from "hourly run #400", which nothing in the data itself can tell us — a
+# report table having rows only means SOME process loaded them, and an account
+# with no spend produces no rows at all no matter how often we run.
+SYNC_STATE_TABLE = "openai_ads_sync_state"
 # Global floor date: the pipeline never pulls earlier than this unless an
 # account overrides it with its own "start_date". Format YYYY-MM-DD.
 START_DATE = os.environ.get("START_DATE", "2026-05-01")
@@ -401,6 +446,78 @@ def relabel_null_account(client, table_id, account_name):
     return job.num_dml_affected_rows or 0
 
 
+def ensure_state_table(client):
+    """Create the bookkeeping table if it isn't there yet."""
+    table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{SYNC_STATE_TABLE}"
+    table = bigquery.Table(
+        table_id,
+        schema=[
+            bigquery.SchemaField("account_name", "STRING"),
+            bigquery.SchemaField("report", "STRING"),
+            bigquery.SchemaField("last_until", "DATE"),
+            bigquery.SchemaField("last_run_at", "TIMESTAMP"),
+        ],
+    )
+    client.create_table(table, exists_ok=True)
+    return table_id
+
+
+def read_state(client, account_name, report):
+    """Last day successfully loaded for this account/report, or None if never.
+
+    None means the pipeline has genuinely never completed a run for this pair —
+    which is the signal for the wide first refresh.
+    """
+    table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{SYNC_STATE_TABLE}"
+    query = (
+        f"SELECT last_until FROM `{table_id}` "
+        f"WHERE account_name = @name AND report = @report"
+    )
+    job = client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("name", "STRING", account_name),
+                bigquery.ScalarQueryParameter("report", "STRING", report),
+            ]
+        ),
+    )
+    for row in job.result():
+        return row["last_until"]
+    return None
+
+
+def write_state(client, account_name, report, until):
+    """Record a successful load. Called only after the rows are safely in.
+
+    Leaving it until after the load means a failed run doesn't advance the
+    marker, so the next run retries the same window instead of skipping it.
+    """
+    table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{SYNC_STATE_TABLE}"
+    query = f"""
+        MERGE `{table_id}` T
+        USING (
+          SELECT @name AS account_name, @report AS report, @until AS last_until
+        ) S
+        ON T.account_name = S.account_name AND T.report = S.report
+        WHEN MATCHED THEN UPDATE SET
+          last_until = S.last_until, last_run_at = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN INSERT
+          (account_name, report, last_until, last_run_at)
+          VALUES (S.account_name, S.report, S.last_until, CURRENT_TIMESTAMP())
+    """
+    client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("name", "STRING", account_name),
+                bigquery.ScalarQueryParameter("report", "STRING", report),
+                bigquery.ScalarQueryParameter("until", "DATE", until.isoformat()),
+            ]
+        ),
+    ).result()
+
+
 def replace_window(client, table_id, since, until, account_name):
     """Delete this account's rows in the window so each load is idempotent.
 
@@ -461,39 +578,103 @@ def _account_floor(account):
     return _parse_date(account.get("start_date", START_DATE), "start_date")
 
 
+def _window_start(client, account_name, report, floor, until, backfill):
+    """Decide how far back this run reaches for one account/report.
+
+    The day's FIRST run -> DAILY_LOOKBACK_DAYS (7). A deep sweep that re-pulls
+        the past week, so anything the API restated since yesterday gets
+        corrected. The very first run the pipeline ever performs takes this
+        path too, since it has no marker either.
+
+    Every run after that, same day -> LOOKBACK_DAYS (1), i.e. today only. This
+        morning's sweep already settled the older days; there is nothing to
+        gain from re-pulling them 23 more times.
+
+    "First run of the day" is decided by comparing today against the marker,
+    which records the last day a run completed. last < today means no run has
+    covered today yet. The marker also makes an outage self-correcting: come
+    back after three days down and the next run is a first-of-day run, so it
+    sweeps a week and closes the gap without anyone asking.
+
+    Nothing here derives a window from how STALE the marker is, so no amount of
+    downtime or dormancy can widen a run beyond DAILY_LOOKBACK_DAYS. Gaps older
+    than a week are a ?backfill=true job.
+    """
+    if backfill:
+        return floor
+
+    last = read_state(client, account_name, report)
+
+    if last is None:
+        log.info("    first run ever -> %s day sweep", DAILY_LOOKBACK_DAYS)
+        start = until - timedelta(days=DAILY_LOOKBACK_DAYS - 1)
+    elif last < until:
+        log.info("    first run of %s -> %s day sweep", until, DAILY_LOOKBACK_DAYS)
+        start = until - timedelta(days=DAILY_LOOKBACK_DAYS - 1)
+    else:
+        start = until - timedelta(days=LOOKBACK_DAYS - 1)
+
+    return max(floor, start)
+
+
 def _run_account(client, account, backfill):
     """Run all three reports for a single account. Raises on failure."""
     name = account["name"]
     floor = _account_floor(account)
-    until = date.today() - timedelta(days=1)            # through yesterday
+    # Through TODAY, not yesterday: the job runs hourly, so today's partial
+    # numbers are the whole point. Each run replaces the window rather than
+    # adding to it, so the partial day is corrected as the day fills in.
+    until = date.today()
 
-    if backfill:
-        since = floor
-        log.info("  [%s] BACKFILL: %s to %s", name, since, until)
-    else:
-        since = max(floor, until - timedelta(days=LOOKBACK_DAYS - 1))
-        log.info("  [%s] daily (lookback=%s): %s to %s", name, LOOKBACK_DAYS, since, until)
+    log.info("  [%s] %s through %s", name, "BACKFILL" if backfill else "refresh", until)
 
-    if since > until:
-        log.info("  [%s] nothing to pull (since %s after until %s).", name, since, until)
-        return 0
+    ensure_state_table(client)
 
     session = _session(account["api_key"])
     total = 0
     for report_name, cfg in REPORTS.items():
-        log.info("  [%s] report: %s", name, report_name)
+        table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{cfg['table']}"
+        schema = build_schema(cfg)
+
+        ensure_table(client, table_id, schema)
+        ensure_account_column(client, table_id)
+
+        # Tracked per (account, report), so a report added later takes its own
+        # wide first refresh without dragging the others back through days they
+        # already hold.
+        since = _window_start(client, name, report_name, floor, until, backfill)
+        if since > until:
+            log.info("  [%s] %s: nothing to pull.", name, report_name)
+            continue
+
+        log.info("  [%s] report: %s (%s to %s)", name, report_name, since, until)
         raw = fetch_report_rows(
             session, cfg["aggregation_level"], cfg["api_fields"], since, until
         )
         rows = transform_rows(raw, cfg, name)
 
-        table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{cfg['table']}"
-        schema = build_schema(cfg)
+        # Never clear the window on an empty response. The load is a DELETE
+        # followed by an INSERT, so if the API hands back nothing the delete
+        # would wipe the window and the insert would put nothing back — a week
+        # of history gone on the daily sweep, with no error to show for it.
+        # Treat empty as "this run told us nothing" and leave the table alone.
+        # Skipping write_state too means the next run retries this same window
+        # instead of stepping over it.
+        if not rows:
+            log.warning(
+                "  [%s] %s: API returned 0 rows for %s..%s — leaving existing "
+                "data untouched and retrying next run.",
+                name, report_name, since, until,
+            )
+            continue
 
-        ensure_table(client, table_id, schema)
-        ensure_account_column(client, table_id)        # safe before delete
         replace_window(client, table_id, since, until, name)
         load_rows(client, table_id, rows, schema)
+
+        # Only now, with the rows committed, does this run count as done. A
+        # crash anywhere above leaves the marker where it was, so the next run
+        # covers the same window again rather than stepping over it.
+        write_state(client, name, report_name, until)
         total += len(rows)
 
     log.info("  [%s] done: %s rows.", name, total)
