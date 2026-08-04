@@ -136,10 +136,6 @@ PAGE_LIMIT = 1000          # rows per page (API max is 10000)
 MAX_RETRIES = 6            # retry attempts for 429 / 5xx
 REQUEST_TIMEOUT = 60       # seconds
 
-# Substring of the 400 the API returns when the range ends past its own clock.
-# See resolve_until for why we discover the usable end date instead of assuming.
-FUTURE_END_MARKER = "cannot be in the future"
-
 # Synthetic source key used to stamp the account name onto every row.
 ACCOUNT_NAME_KEY = "_account_name"
 ACCOUNT_NAME_COL = "Account name"
@@ -297,56 +293,6 @@ def _get_with_retries(session, url, params):
         )
 
     raise RuntimeError(f"Exhausted retries calling {url}")
-
-
-def resolve_until(session, start_guess, max_back=3):
-    """Latest date the API will accept as a range end.
-
-    The API rejects a range ending "in the future", measured against its own
-    clock, which does not track UTC — so date.today() on Cloud Run is a day
-    ahead of it for part of every day and the call 400s:
-
-        400: time_ranges.end cannot be in the future.
-
-    Rather than hardcode an offset we cannot see from here, ask: probe with a
-    single-row request and step back a day until one is accepted. That lands on
-    the newest day the API will actually serve, at any hour, and keeps working
-    if OpenAI ever changes the timezone it reports in.
-
-    Everything downstream uses the answer — the window decision, the delete,
-    and the marker — so all three agree on what "today" means. Comparing the
-    marker against a UTC date the API refuses to serve would make every run
-    look like the day's first and sweep 7 days, 24 times a day.
-    """
-    url = f"{API_BASE_URL}/ad_account/insights"
-    cfg = REPORTS["campaign"]          # cheapest report to probe with
-    day = start_guess
-
-    for _ in range(max_back + 1):
-        params = [
-            ("time_granularity", "daily"),
-            ("aggregation_level", cfg["aggregation_level"]),
-            ("limit", "1"),
-            ("time_ranges[]", json.dumps(
-                {"type": "date_range", "since": day.isoformat(), "until": day.isoformat()}
-            )),
-        ]
-        for f in cfg["api_fields"]:
-            params.append(("fields[]", f))
-
-        try:
-            _get_with_retries(session, url, params)
-            return day
-        except RuntimeError as exc:
-            if FUTURE_END_MARKER not in str(exc):
-                raise
-            log.info("    API calls %s a future date; trying %s",
-                     day, day - timedelta(days=1))
-            day -= timedelta(days=1)
-
-    raise RuntimeError(
-        f"API rejected every end date from {start_guess} back {max_back} days"
-    )
 
 
 def fetch_report_rows(session, aggregation_level, api_fields, since, until):
@@ -675,17 +621,16 @@ def _run_account(client, account, backfill):
     """Run all three reports for a single account. Raises on failure."""
     name = account["name"]
     floor = _account_floor(account)
-    session = _session(account["api_key"])
-
-    # Through the CURRENT day, not yesterday: the job runs hourly, so today's
-    # partial numbers are the whole point, and each run replaces its window
-    # rather than adding to it so the partial day firms up as the day fills in.
-    # Which day is "current" is the API's call, not ours — see resolve_until.
-    until = resolve_until(session, date.today())
+    # Through TODAY, not yesterday: the job runs hourly, so today's partial
+    # numbers are the whole point. Each run replaces the window rather than
+    # adding to it, so the partial day is corrected as the day fills in.
+    until = date.today()
 
     log.info("  [%s] %s through %s", name, "BACKFILL" if backfill else "refresh", until)
 
     ensure_state_table(client)
+
+    session = _session(account["api_key"])
     total = 0
     for report_name, cfg in REPORTS.items():
         table_id = f"{GCP_PROJECT}.{BQ_DATASET}.{cfg['table']}"
